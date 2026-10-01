@@ -1,0 +1,2 @@
+pydantic-ai-slim[typesafe]==2.52.0
+factorio-rcon-py==2.1.3

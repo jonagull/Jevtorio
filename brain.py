@@ -19,11 +19,9 @@ GOAL = (
     "Goal: automate red science (automation science packs) and research with it. Every burner machine "
     "(drills, furnaces, burner inserters, the boiler) needs coal. Assemblers and labs need electricity from steam power. "
     "Play efficiently: hand-mining is slow, so automate any resource you keep needing (coal and copper especially) "
-    "with drill lines, and prefer building toward automation over doing the same chore by hand again."
+    "with drill lines and columns, and prefer building toward automation over doing the same chore by hand again."
 )
 
-# What one smelting line needs (see Factorio.build_smelting_line).
-LINE_PARTS = {"burner-mining-drill": 2, "transport-belt": 5, "burner-inserter": 2, "stone-furnace": 1, "iron-chest": 1}
 RED_PACK = "automation-science-pack"
 GATHERABLE = {"coal", "stone", "wood", "iron-plate", "copper-plate", "iron-ore", "copper-ore"}
 
@@ -42,7 +40,7 @@ class Action:
 class Plan:
     """Something worth building. Jev can pursue it before it's affordable; Python does the gathering."""
     description: str
-    needs: dict[str, int]
+    needs: dict[str, int] | Callable[[dict], dict[str, int]]  # callable when it depends on the map
     build: Callable[[Factorio], str]
     wanted: Callable[[dict], bool]  # prerequisites met and not built enough yet
 
@@ -76,10 +74,15 @@ def _low_fuel(obs: dict) -> bool:
     return any(b.get("burner") and b["fuel"] < 3 for b in obs["built"])
 
 
+def _collectable(b: dict) -> bool:
+    """Not a chest the bot fills (module inputs), keeps full (coal feeds) or stores surplus in."""
+    return not (b.get("role") or "").startswith(("input", "feed", "storage"))
+
+
 def _output_waiting(obs: dict) -> bool:
     return any(
         sum(b.get("output", {}).values()) > 0
-        or (b["type"] == "container" and not (b.get("role") or "").startswith("input") and b.get("contents"))
+        or (b["type"] == "container" and _collectable(b) and b.get("contents"))
         for b in obs["built"]
     )
 
@@ -100,7 +103,8 @@ def _loose_furnace_for(obs: dict, ore: str) -> bool:
 
 
 def _lines(obs: dict, resource: str) -> int:
-    return sum(b["type"] == "mining-drill" for b in _has_role(obs, f"line:{resource}")) // 2
+    per = builds.parts(builds.COAL_LINE)["burner-mining-drill"] if resource == "coal" else builds.COLUMN_DRILLS
+    return sum(b["type"] == "mining-drill" for b in _has_role(obs, f"line:{resource}")) // per
 
 
 # ---- action implementations ----------------------------------------------------
@@ -116,13 +120,6 @@ def _craft(item: str, n: int = 1):
         made = f.craft_deep(item, n)
         return f"crafted {made} {item}" if made else f"failed to craft {item}"
     return run
-
-
-def _place_drill(f: Factorio, obs: dict) -> str:
-    r = f.place_drill_on("iron-ore")
-    if not r["ok"]:
-        return f"could not place drill: {r['reason']}"
-    return "placed a drill on iron" + (" with a furnace at its output" if r["furnace"] else " (no furnace, ore drops on the ground)")
 
 
 def _smelt(ore: str):
@@ -147,50 +144,162 @@ def _stock(f: Factorio, obs: dict) -> str:
     return "stocked " + (", ".join(f"{n} {k}" for k, n in moved.items() if n) or "nothing (no matching plates)")
 
 
-def _build_line(resource: str):
+def _build_on(resource: str, layout: list[dict], site: str | None = None):
+    """Build stage 1 of `layout` on the nearest `resource`, grid-aligned; later stages get a reserved `site`."""
     def run(f: Factorio) -> str:
-        builds.craft_all(f, LINE_PARTS)
-        r = f.build_smelting_line(resource, drills=2)
-        if not r["ok"]:
-            return f"could not build a {resource} line: {r['reason']}"
-        return f"built an automated {resource} smelting line at ({r['x']}, {r['y']})"
+        builds.craft_all(f, builds.parts(builds.stage(layout, 1)))
+        ore = f.lua(f'local e = nearest("{resource}", bot.position) if e then out({{x = e.position.x, y = e.position.y}}) end')
+        if not ore:
+            return f"no {resource} nearby"
+        f.walk_to(ore["x"], ore["y"], stop_short=3)
+        r = f.place_layout(layout, (ore["x"], ore["y"]), radius=24, label=f"{resource} line", site=site, grid=2)
+        return f"built an automated {resource} line at ({r['x']}, {r['y']})" if r["ok"] else f"could not build a {resource} line: {r['reason']}"
     return run
 
 
-def _build_coal_line(f: Factorio) -> str:
-    builds.craft_all(f, builds.parts(builds.COAL_LINE))
-    coal = f.lua('local e = nearest("coal", bot.position) if e then out({x = e.position.x, y = e.position.y}) end')
-    if not coal:
-        return "no coal nearby"
-    f.walk_to(coal["x"], coal["y"], stop_short=3)
-    r = f.place_layout(builds.COAL_LINE, (coal["x"], coal["y"]), radius=24)
-    return f"built an automated coal line at ({r['x']}, {r['y']})" if r["ok"] else f"could not build a coal line: {r['reason']}"
+def _columns_to_upgrade(obs: dict) -> list[dict]:
+    return [s for s in obs.get("sites") or [] if s["kind"].startswith("column:") and not s["done"]]
+
+
+def _column_layout(site: dict) -> list[dict]:
+    return builds.smelt_column(site["kind"].split(":")[1])
+
+
+COLUMN_UPGRADE = {**builds.parts(builds.stage(builds.smelt_column("iron-ore"), 2)), "coal": 24}
+
+
+def _upgrade_column(f: Factorio) -> str:
+    sites = _columns_to_upgrade(f.observe())
+    if not sites:
+        return "no column waiting for its belts"
+    site = sites[0]
+    builds.craft_all(f, builds.parts(builds.stage(_column_layout(site), 2)))
+    f.walk_to(site["x"], site["y"], stop_short=3)
+    r = f.place_layout(_column_layout(site), (site["x"], site["y"]), radius=0, stage=2, site=site["kind"],
+                       ignore_reserved=True, label=site["kind"].split(":")[1] + " column")
+    return f"added the fuel belt and plate output to the {site['kind'].split(':')[1]} column" if r["ok"] \
+        else f"could not upgrade the column: {r['reason']}"
+
+
+@dataclass
+class Link:
+    """A belt worth laying: from a source (coal line chest, or a column's plate output) to an entry that wants it."""
+    kind: str  # "coal" or "plates"
+    source: dict
+    entry: dict
+    start: tuple[float, float]
+    feeder: tuple[float, float] | None  # burner inserter that lifts coal out of a chest onto the belt
+    done: tuple[str, str]  # roles for source and entry once connected
+
+    @property
+    def belts(self) -> int:
+        return int(abs(self.start[0] - (self.entry["x"] - 1)) + abs(self.start[1] - self.entry["y"])) + 1
+
+
+def _dist(a: dict, b: dict) -> float:
+    return abs(a["x"] - b["x"]) + abs(a["y"] - b["y"])
+
+
+def _links(obs: dict, kind: str) -> list[Link]:
+    built, links = obs["built"], []
+    if kind == "coal":
+        chests = [b for b in _has_role(obs, "line:coal") if b["type"] == "container"]
+        for entry in (b for b in built if b.get("role") == "fuel-in"):
+            if chests:
+                c = min(chests, key=lambda c: _dist(c, entry))
+                chests.remove(c)
+                links.append(Link("coal", c, entry, (c["x"], c["y"] + 2), (c["x"], c["y"] + 1), ("feed:coal", "fuel-in:done")))
+    else:
+        for out in (b for b in _has_role(obs, "plates-out:") if not b["role"].endswith(":done")):
+            plate = out["role"].split(":")[1]
+            entries = [b for b in built if b.get("role") == f"plates-in:{plate}"]
+            if entries:
+                e = min(entries, key=lambda e: _dist(e, out))
+                links.append(Link("plates", out, e, (out["x"] - 1, out["y"]), None, (out["role"] + ":done", e["role"] + ":done")))
+    return links
+
+
+def _link_needs(kind: str):
+    def needs(obs: dict) -> dict[str, int]:
+        links = _links(obs, kind)
+        if not links:
+            return {}
+        return {"transport-belt": links[0].belts, **({"burner-inserter": 1} if links[0].feeder else {})}
+    return needs
+
+
+def _lay_link(kind: str):
+    def build(f: Factorio) -> str:
+        links = _links(f.observe(), kind)
+        if not links:
+            return f"nothing to connect with a {kind} belt"
+        link = links[0]
+        f.walk_to((link.source["x"] + link.entry["x"]) / 2, (link.source["y"] + link.entry["y"]) / 2)
+        builds.craft_all(f, {"transport-belt": link.belts})
+        r = f.lay_belt(link.start, link.entry, link.feeder, label=f"{kind} belt")
+        if not r["ok"]:
+            return f"could not lay a {kind} belt: {r['reason']}"
+        f.set_role(link.source["x"], link.source["y"], link.done[0])
+        f.set_role(link.entry["x"], link.entry["y"], link.done[1])
+        return f"laid a {r['belts']}-belt {kind} line"
+    return build
 
 
 PLANS: dict[str, Plan] = {
     "coal_line": Plan(
-        "an automated coal line: 2 burner drills on coal that fill a chest with coal, so fuel no longer has to be mined by hand",
-        {"burner-mining-drill": 2, "iron-chest": 1, "coal": 4},
-        _build_coal_line,
-        lambda o: "coal" in o["ores"] and _lines(o, "coal") < 2,
+        "a self-fuelling coal line: 2 burner drills and an inserter that keep each other fuelled and fill a chest with coal, "
+        "so fuel no longer has to be mined by hand",
+        {**builds.parts(builds.COAL_LINE), "coal": 6},
+        _build_on("coal", builds.COAL_LINE),
+        # One coal line for the bot, plus one to feed each smelting column's fuel belt.
+        lambda o: "coal" in o["ores"] and _lines(o, "coal") < min(6, 1 + len(_has_role(o, "fuel-in"))),
     ),
     "copper_line": Plan(
-        "an automated copper smelting line: 2 burner drills put copper ore on a belt into a furnace, plates collect in a chest",
-        {**LINE_PARTS, "coal": 10},
-        _build_line("copper-ore"),
-        lambda o: "copper-ore" in o["ores"] and _lines(o, "copper-ore") < 2,
+        "an automated copper smelting column: 4 burner drills, each dropping straight into its own furnace "
+        "(belts and inserters are added later with upgrade_column)",
+        {**builds.parts(builds.stage(builds.smelt_column("copper-ore"), 1)), "coal": 20},
+        _build_on("copper-ore", builds.smelt_column("copper-ore"), site="column:copper-ore"),
+        # One staged column (older columns have no plate output to belt to the hub).
+        lambda o: "copper-ore" in o["ores"] and _lines(o, "copper-ore") < 2
+        and not any(s["kind"] == "column:copper-ore" for s in o.get("sites") or []),
     ),
     "iron_line": Plan(
-        "another automated iron smelting line: 2 burner drills put iron ore on a belt into a furnace, plates collect in a chest",
-        {**LINE_PARTS, "coal": 10},
-        _build_line("iron-ore"),
-        lambda o: "iron-ore" in o["ores"] and _lines(o, "iron-ore") < 3,
+        "an automated iron smelting column: 4 burner drills, each dropping straight into its own furnace "
+        "(belts and inserters are added later with upgrade_column)",
+        {**builds.parts(builds.stage(builds.smelt_column("iron-ore"), 1)), "coal": 20},
+        _build_on("iron-ore", builds.smelt_column("iron-ore"), site="column:iron-ore"),
+        lambda o: "iron-ore" in o["ores"] and _lines(o, "iron-ore") < 2,
+    ),
+    "column_upgrade": Plan(
+        "the second stage of a smelting column: a coal belt loop with burner inserters fuelling every drill and furnace, "
+        "and output inserters putting plates on a belt that can run to the red science module",
+        COLUMN_UPGRADE,
+        _upgrade_column,
+        lambda o: bool(_columns_to_upgrade(o)),
+    ),
+    "coal_belt": Plan(
+        "a coal belt from a coal line to a smelting column, so its drills and furnaces are fuelled automatically",
+        _link_needs("coal"),
+        _lay_link("coal"),
+        lambda o: bool(_links(o, "coal")),
+    ),
+    "plate_belt": Plan(
+        "a plate belt from a smelting column to the red science module, so plates arrive without being carried",
+        _link_needs("plates"),
+        _lay_link("plates"),
+        lambda o: bool(_links(o, "plates")),
     ),
     "steam_power": Plan(
         "steam power at the nearest water: offshore pump, boiler and steam engine",
         {**builds.POWER_PARTS, "coal": 5},
         builds.build_power,
         lambda o: _researched(o, "electronics") and not _built(o, "steam-engine"),
+    ),
+    "boiler_feed": Plan(
+        "a coal entry at the boiler (a burner inserter and one belt), so a coal belt can keep the steam power running",
+        {"burner-inserter": 1, "transport-belt": 1},
+        builds.feed_boiler,
+        lambda o: bool(_built(o, "steam-engine")) and not _has_role(o, "boiler-feed"),
     ),
     "lab": Plan(
         "a lab next to the power plant, wired with poles (crafting it unlocks red science)",
@@ -200,20 +309,27 @@ PLANS: dict[str, Plan] = {
     ),
     "red_science_module": Plan(
         "the automated red science module next to the power plant: a gear assembler feeds a red science assembler "
-        "that inserts straight into a lab, fed with plates through two chests",
+        "that inserts straight into a lab, fed by plate belts from the smelting columns",
         builds.module_needs(builds.RED_SCIENCE),
         lambda f: builds.build_module(f, "the red science module", builds.RED_SCIENCE),
-        lambda o: _researched(o, "automation") and not _has_role(o, "input:"),
+        lambda o: _researched(o, "automation") and len(_has_role(o, "module:red")) + len(_has_role(o, "input:iron-plate")) < 2,
     ),
 }
 
 # Shortfalls worked out each step: every plan, plus a couple of one-off crafts.
-SHORTFALLS = {**{name: p.needs for name, p in PLANS.items()}, "red_science_by_hand": {RED_PACK: 1}, "burner_drill": {"burner-mining-drill": 1}}
+# One-off crafts whose shortfall is also worked out each step.
+# Ingredients, not the pack itself: a pack already in the inventory says nothing about crafting more.
+EXTRA_SHORTFALLS = {"red_science_by_hand": {"iron-gear-wheel": 1, "copper-plate": 1}, "burner_drill": {"burner-mining-drill": 1}}
+
+
+def _needs(plan: Plan, obs: dict) -> dict[str, int]:
+    return plan.needs(obs) if callable(plan.needs) else plan.needs
 
 
 def enrich(f: Factorio, obs: dict) -> dict:
     """Add what's still missing for each plan, so availability and descriptions can use it."""
-    obs["short"] = {name: builds.missing(f, needs) for name, needs in SHORTFALLS.items()}
+    needs = {**{name: _needs(p, obs) for name, p in PLANS.items()}, **EXTRA_SHORTFALLS}
+    obs["short"] = {name: builds.missing(f, n) for name, n in needs.items()}
     return obs
 
 
@@ -233,7 +349,7 @@ def _gather_step(f: Factorio, obs: dict, item: str, amount: int) -> str:
     plate, ore = item, item.replace("-plate", "-ore")
     ready = any(
         b.get("output", {}).get(plate) or b.get("contents", {}).get(plate)
-        for b in obs["built"] if not (b.get("role") or "").startswith("input")
+        for b in obs["built"] if _collectable(b)
     )
     if ready:
         return f"collected {f.collect_output()} items"
@@ -251,7 +367,7 @@ def _pursue(name: str):
             return plan.build(f)
         item = next(i for i in GATHER_ORDER if i in short)
         step = _gather_step(f, obs, item, short[item])
-        if not builds.missing(f, plan.needs):
+        if not builds.missing(f, _needs(plan, obs)):
             return f"{step}, then {plan.build(f)}"
         return f"{step} (toward {name.replace('_', ' ')})"
     return run
@@ -318,11 +434,6 @@ ACTIONS: dict[str, Action] = {
         lambda o: _count(o, RED_PACK) >= 1 and bool(_built(o, "lab")),
         _feed_labs,
     ),
-    "start_research": Action(
-        "Choose a technology for the labs to research.",
-        lambda o: "current" not in o["research"] and bool(_lab_techs(o)) and bool(_built(o, "lab")),
-        lambda f, o: "",  # filled in by Brain, which asks Jev which technology
-    ),
     "stock_red_science_module": Action(
         "Carry iron and copper plates from the inventory to the red science module's input chests.",
         lambda o: bool(_has_role(o, "input:")) and (_count(o, "iron-plate") >= 10 or _count(o, "copper-plate") >= 10),
@@ -334,6 +445,11 @@ ACTIONS: dict[str, Action] = {
 
 # ---- what Jev is told --------------------------------------------------------
 
+def research_idle(obs: dict) -> bool:
+    """Labs exist but nothing is being researched: main.py then asks Jev for the next technology."""
+    return "current" not in obs["research"] and bool(_lab_techs(obs)) and bool(_built(obs, "lab"))
+
+
 def milestone(obs: dict) -> str:
     if not _researched(obs, "electronics"):
         return "Smelt 10 copper plates (in any furnace) to unlock Electronics: circuits, labs, inserters and poles."
@@ -342,10 +458,11 @@ def milestone(obs: dict) -> str:
     if not _built(obs, "lab"):
         return "Build a lab next to the power plant. Crafting it unlocks the red science recipe."
     if not _researched(obs, "automation"):
-        return "Research Automation: hand-craft 10 red science, put it in the lab and start the research."
-    if not _has_role(obs, "input:"):
+        return "Research Automation: hand-craft 10 red science and put it in the lab (research starts by itself)."
+    if not (_has_role(obs, "input:") or _has_role(obs, "module:red")):
         return "Build the automated red science module."
-    return "Keep the red science module stocked with iron and copper plates, keep everything fueled and keep research going."
+    return ("Connect smelting columns to the red science module with plate belts and coal lines to every fuel belt, "
+            "keep everything fueled and keep research going.")
 
 
 def _fmt(items: dict) -> str:
@@ -360,6 +477,8 @@ def describe(obs: dict, history: list[str]) -> str:
 
     for ore, info in obs["ores"].items():
         lines.append(f"Nearest {ore}: {info['distance']} tiles away.")
+    if not _lines(obs, "iron-ore"):
+        lines.append("No iron smelting column yet: nearly everything needs iron plates, so one should come first.")
     lines.append("Automated lines: " + ", ".join(f"{_lines(obs, r)} {r.replace('-ore', '')}" for r in ("iron-ore", "copper-ore", "coal")) + ".")
 
     research = obs["research"]
@@ -415,6 +534,10 @@ PROGRESS_LEVELS = [
 ]
 
 
+def _failed(entry: str) -> bool:
+    return any(w in entry for w in ("failed", "could not", "error:", "cannot", "no room"))
+
+
 @dataclass
 class Thought:
     """Everything Jev said about one moment in the game."""
@@ -432,7 +555,10 @@ class Brain:
 
     async def think(self, obs: dict, history: list[str]) -> Thought:
         state = describe(obs, history)
-        options = {name: a.describe(obs) for name, a in ACTIONS.items() if a.available(obs)}
+        # An action that just failed twice in a row is left out once, so a broken action can't loop forever.
+        last = history[-2:]
+        stuck = last[0].split(":")[0] if len(last) == 2 and last[0] == last[1] and _failed(last[0]) else None
+        options = {name: a.describe(obs) for name, a in ACTIONS.items() if a.available(obs) and name != stuck}
         if self.model is None:
             pick = random.choice(list(options))
             return Thought(state, pick, {name: 1.0 if name == pick else 0.0 for name in options})

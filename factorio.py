@@ -16,6 +16,12 @@ storage.jev = storage.jev or {built = {}}
 local J = storage.jev
 J.roles = J.roles or {}
 J.crafted = J.crafted or {}
+J.sites = J.sites or {}
+local function overlaps(a, b) return a[1][1] < b[2][1] and b[1][1] < a[2][1] and a[1][2] < b[2][2] and b[1][2] < a[2][2] end
+local function reserved(area)
+  for _, s in pairs(J.sites) do if not s.done and overlaps(area, s.box) then return true end end
+  return false
+end
 local bot = J.char
 if bot and not bot.valid then bot = nil end
 local function track(e) J.built[e.unit_number] = e end
@@ -48,8 +54,9 @@ end
 
 ORES = ["iron-ore", "copper-ore", "coal", "stone"]
 STARTING_ITEMS = {"burner-mining-drill": 1, "stone-furnace": 1, "iron-plate": 8, "wood": 1}
-WALK_SPEED = 9.0  # tiles/second, close to a real character
-MINE_SECONDS = 1.0  # per ore; real hand mining is ~2s, sped up so it's less dull
+WALK_SPEED = 15.0  # tiles/second; a real character is ~9, faster so long walks between patches are less dull
+MINE_SECONDS = 0.5  # per ore; real hand mining is ~2s, sped up so it's less dull
+KEEP = 400  # most of one item the bot carries; more stays in machines or goes to storage chests
 
 
 class LuaError(RuntimeError):
@@ -81,6 +88,7 @@ class Factorio:
         """Create the bot character near spawn if it doesn't exist yet."""
         items = "{" + ", ".join(f'["{k}"] = {v}' for k, v in STARTING_ITEMS.items()) + "}"
         return self.lua(f"""
+            S.peaceful_mode = true
             if bot then out({{spawned = false}}) return end
             local p = S.find_non_colliding_position("character", {{4, 4}}, 20, 0.5)
             bot = S.create_entity{{name = "character", position = p, force = "player"}}
@@ -154,7 +162,9 @@ class Factorio:
             if force.current_research then
               research.current = {{name = force.current_research.name, progress = force.research_progress}}
             end
-            out({{tick = game.tick, x = bot.position.x, y = bot.position.y,
+            local stats, made = force.get_item_production_statistics(S), {{}}
+            for _, n in pairs({{"iron-plate", "copper-plate", "automation-science-pack"}}) do made[n] = stats.get_input_count(n) end
+            out({{tick = game.tick, x = bot.position.x, y = bot.position.y, made = made, sites = J.sites,
                  inventory = inv(bot.get_main_inventory()), ores = ores, built = built, research = research}})
         """)
 
@@ -191,10 +201,12 @@ class Factorio:
             got = self.lua(f"""
                 local e = S.find_entity("{resource}", {{{ore['x']}, {ore['y']}}})
                 if not e then out({{got = 0}}) return end
+                if bot.insert{{name = "{resource}", count = 1}} == 0 then out({{got = 0, full = true}}) return end
                 if e.amount <= 1 then e.destroy() else e.amount = e.amount - 1 end
-                bot.insert{{name = "{resource}", count = 1}}
                 out({{got = 1}})
             """)
+            if got.get("full"):
+                break
             mined += got["got"]
             time.sleep(MINE_SECONDS)
         return mined
@@ -257,45 +269,6 @@ class Factorio:
         """)
         return r["ok"]
 
-    def place_drill_on(self, resource: str) -> dict:
-        """Place a burner drill on `resource`, fuel it, and put a furnace at its output if we have one."""
-        ore = self.lua(f'local e = nearest("{resource}", bot.position) if e then out({{x = e.position.x, y = e.position.y}}) end')
-        if not ore:
-            return {"ok": False, "reason": f"no {resource} nearby"}
-        self.walk_to(ore["x"], ore["y"], stop_short=3)
-        return self.lua(f"""
-            if bot.get_item_count("burner-mining-drill") < 1 then out({{ok = false, reason = "no drill"}}) return end
-            local spot
-            for r = 0, 12 do
-              for dx = -r, r do for dy = -r, r do
-                local p = {{{ore['x']} + dx, {ore['y']} + dy}}
-                if not spot and S.can_place_entity{{name = "burner-mining-drill", position = p, direction = defines.direction.south, force = "player"}}
-                   and S.can_place_entity{{name = "stone-furnace", position = {{p[1], p[2] + 2}}, force = "player"}} then
-                  spot = p
-                end
-              end end
-              if spot then break end
-            end
-            if not spot then out({{ok = false, reason = "no room on the patch"}}) return end
-            local d = S.create_entity{{name = "burner-mining-drill", position = spot, direction = defines.direction.south, force = "player"}}
-            bot.remove_item{{name = "burner-mining-drill", count = 1}}
-            track(d)
-            local coal = math.min(5, bot.get_item_count("coal"))
-            if coal > 0 then d.get_fuel_inventory().insert{{name = "coal", count = coal}} bot.remove_item{{name = "coal", count = coal}} end
-            local furnace = false
-            if bot.get_item_count("stone-furnace") > 0 then
-              local f = S.create_entity{{name = "stone-furnace", position = {{spot[1], spot[2] + 2}}, force = "player"}}
-              if f then
-                bot.remove_item{{name = "stone-furnace", count = 1}}
-                track(f)
-                local c = math.min(3, bot.get_item_count("coal"))
-                if c > 0 then f.get_fuel_inventory().insert{{name = "coal", count = c}} bot.remove_item{{name = "coal", count = c}} end
-                furnace = true
-              end
-            end
-            out({{ok = true, furnace = furnace, fueled = coal > 0}})
-        """)
-
     def _visit_built(self, lua_filter: str) -> list[dict]:
         """Positions of built entities matching a Lua condition on `e`."""
         return self.lua(f"""
@@ -348,6 +321,7 @@ class Factorio:
         for t in self._visit_built(
             '(e.type == "furnace" and not e.get_inventory(defines.inventory.furnace_result).is_empty())'
             ' or (e.type == "container" and not (J.roles[e.unit_number] or ""):find("^input")'
+            ' and not (J.roles[e.unit_number] or ""):find("^feed") and not (J.roles[e.unit_number] or ""):find("^storage")'
             ' and not e.get_inventory(defines.inventory.chest).is_empty())'
         ):
             self.walk_to(t["x"], t["y"], stop_short=2)
@@ -356,14 +330,47 @@ class Factorio:
                 local out_inv = e.get_inventory(e.type == "furnace" and defines.inventory.furnace_result or defines.inventory.chest)
                 local n = 0
                 for _, it in pairs(out_inv.get_contents()) do
-                  local moved = bot.insert{{name = it.name, count = it.count}}
-                  out_inv.remove{{name = it.name, count = moved}}
+                  local want = math.min(it.count, {KEEP} - bot.get_item_count(it.name))
+                  local moved = want > 0 and bot.insert{{name = it.name, count = want}} or 0
+                  if moved > 0 then out_inv.remove{{name = it.name, count = moved}} end
                   n = n + moved
                 end
                 out({{n = n}})
             """)
             taken += r["n"]
         return taken
+
+    def stash_excess(self) -> int:
+        """When the inventory is nearly full, put anything over KEEP (except buildings) into storage chests by the bot."""
+        return self.lua(f"""
+            local main = bot.get_main_inventory()
+            if main.count_empty_stacks() >= 5 then out({{n = 0}}) return end
+            local moved = 0
+            for _, it in pairs(main.get_contents()) do
+              local extra = bot.get_item_count(it.name) - {KEEP}
+              while extra > 0 and not prototypes.item[it.name].place_result do
+                local chest
+                for _, e in pairs(J.built) do
+                  if e.valid and J.roles[e.unit_number] == "storage" and e.can_insert{{name = it.name}} then chest = e break end
+                end
+                if not chest then
+                  if bot.get_item_count("wood") < 2 then break end
+                  local p = S.find_non_colliding_position("wooden-chest", bot.position, 10, 1)
+                  if not p then break end
+                  bot.remove_item{{name = "wood", count = 2}}
+                  chest = S.create_entity{{name = "wooden-chest", position = p, force = "player"}}
+                  track(chest)
+                  J.roles[chest.unit_number] = "storage"
+                  pcall(function() game.forces.player.add_chart_tag(S, {{position = p, text = "Jev: storage"}}) end)
+                end
+                local n = chest.insert{{name = it.name, count = extra}}
+                if n == 0 then break end
+                bot.remove_item{{name = it.name, count = n}}
+                extra, moved = extra - n, moved + n
+              end
+            end
+            out({{n = moved}})
+        """)["n"]
 
     def craft_deep(self, recipe: str, count: int = 1) -> int:
         """Craft `recipe`, first hand-crafting any missing intermediates (e.g. gears). Returns how many were made."""
@@ -416,83 +423,6 @@ class Factorio:
             """)
             picked += 1
         return picked
-
-    def build_smelting_line(self, resource: str = "iron-ore", drills: int = 2) -> dict:
-        """Build: drills (facing east) -> belt (south) -> inserter -> furnace -> inserter -> chest.
-
-        Layout, with the drills at (ox, oy + 2k):
-            DD b        D = drill, b = belt, i = burner inserter
-            DD b        F = stone furnace, c = iron chest
-            DD b
-            DD b
-               b
-               i
-               FF
-               FF
-               i
-               c
-        """
-        ore = self.lua(f'local e = nearest("{resource}", bot.position) if e then out({{x = e.position.x, y = e.position.y}}) end')
-        if not ore:
-            return {"ok": False, "reason": f"no {resource} nearby"}
-        self.walk_to(ore["x"], ore["y"], stop_short=3)
-        return self.lua(f"""
-            local N, ore = {drills}, "{resource}"
-            local function layout(ox, oy)
-              local L = {{}}
-              for k = 0, N - 1 do
-                table.insert(L, {{name = "burner-mining-drill", position = {{ox, oy + 2 * k}}, direction = defines.direction.east}})
-              end
-              for y = oy - 0.5, oy + 2 * N - 0.5 do
-                table.insert(L, {{name = "transport-belt", position = {{ox + 1.5, y}}, direction = defines.direction.south}})
-              end
-              local base = oy + 2 * N
-              table.insert(L, {{name = "burner-inserter", position = {{ox + 1.5, base + 0.5}}, direction = defines.direction.north}})
-              table.insert(L, {{name = "stone-furnace", position = {{ox + 2, base + 2}}}})
-              table.insert(L, {{name = "burner-inserter", position = {{ox + 1.5, base + 3.5}}, direction = defines.direction.north}})
-              table.insert(L, {{name = "iron-chest", position = {{ox + 1.5, base + 4.5}}}})
-              return L
-            end
-            local function fits(L)
-              for _, spec in pairs(L) do
-                if not S.can_place_entity{{name = spec.name, position = spec.position, direction = spec.direction, force = "player"}} then return false end
-                if spec.name == "burner-mining-drill" then
-                  local p = spec.position
-                  if S.count_entities_filtered{{name = ore, area = {{{{p[1] - 1, p[2] - 1}}, {{p[1] + 1, p[2] + 1}}}}}} < 3 then return false end
-                end
-              end
-              return true
-            end
-            local needed = {{}}
-            for _, spec in pairs(layout(0, 0)) do needed[spec.name] = (needed[spec.name] or 0) + 1 end
-            for name, n in pairs(needed) do
-              if bot.get_item_count(name) < n then out({{ok = false, reason = "missing " .. name}}) return end
-            end
-            local cx, cy = math.floor({ore['x']}), math.floor({ore['y']})
-            local chosen
-            for r = 0, 24 do
-              for dx = -r, r do for dy = -r, r do
-                if not chosen and math.max(math.abs(dx), math.abs(dy)) == r then
-                  local L = layout(cx + dx, cy + dy)
-                  if fits(L) then chosen = L end
-                end
-              end end
-              if chosen then break end
-            end
-            if not chosen then out({{ok = false, reason = "no room for a line on the patch"}}) return end
-            local coal_each = math.floor(bot.get_item_count("coal") / (N + 3))
-            for _, spec in pairs(chosen) do
-              spec.force = "player"
-              local e = S.create_entity(spec)
-              bot.remove_item{{name = spec.name, count = 1}}
-              track(e)
-              J.roles[e.unit_number] = "line:" .. ore
-              local fuel = e.get_fuel_inventory()
-              if fuel and coal_each > 0 then fuel.insert{{name = "coal", count = coal_each}} bot.remove_item{{name = "coal", count = coal_each}} end
-            end
-            J.lines = (J.lines or 0) + 1
-            out({{ok = true, x = chosen[1].position[1], y = chosen[1].position[2], coal_each = coal_each}})
-        """)
 
     # ---- research ---------------------------------------------------------
 
@@ -553,17 +483,23 @@ class Factorio:
 
     # ---- building from layouts ---------------------------------------------
 
-    def place_layout(self, layout: list[dict], center: tuple[float, float], radius: int = 30, min_radius: int = 0) -> dict:
+    def place_layout(self, layout: list[dict], center: tuple[float, float], radius: int = 30, min_radius: int = 0,
+                     label: str = "", stage: int = 1, site: str | None = None, candidates: list | None = None,
+                     grid: int = 1, ignore_reserved: bool = False) -> dict:
         """Find room for `layout` near `center` and build it, paying for every entity from the inventory.
 
-        Each layout entry: {name, x, y, dir?, recipe?, role?, on?}. `on` requires that resource under a drill.
-        Poles in the layout connect to each other on their own; returns the placed origin.
+        Each layout entry: {name, x, y, dir?, recipe?, role?, on?, stage?}. `on` requires that resource under a drill.
+        Only entries of `stage` (default 1) are built; space for later stages is reserved as a `site`, so nothing
+        else is built there. Trees and rocks in the way are mined. Origins snap to `grid`, or are tried in the
+        order of `candidates`. Poles in the layout connect to each other on their own; returns the placed origin.
         """
         return self.lua(f"""
             local L = helpers.json_to_table({_lua_str(layout)})
-            local cx, cy = math.floor({center[0]}), math.floor({center[1]})
+            local stage, grid, ignore_reserved = {stage}, {grid}, {'true' if ignore_reserved else 'false'}
+            local B, later = {{}}, {{}}
+            for _, s in pairs(L) do table.insert(((s.stage or 1) == stage) and B or ((s.stage or 1) > stage and later or {{}}), s) end
             local needed = {{}}
-            for _, s in pairs(L) do needed[s.name] = (needed[s.name] or 0) + 1 end
+            for _, s in pairs(B) do needed[s.name] = (needed[s.name] or 0) + 1 end
             for name, n in pairs(needed) do
               if bot.get_item_count(name) < n then out({{ok = false, reason = "missing " .. name}}) return end
             end
@@ -571,32 +507,62 @@ class Factorio:
               return {{name = s.name, position = {{ox + s.x, oy + s.y}}, direction = s.dir and defines.direction[s.dir],
                       force = "player", build_check_type = defines.build_check_type.manual}}
             end
+            local function box(s, ox, oy)
+              local cb = prototypes.entity[s.name].collision_box
+              local px, py = ox + s.x, oy + s.y
+              return {{{{px + cb.left_top.x, py + cb.left_top.y}}, {{px + cb.right_bottom.x, py + cb.right_bottom.y}}}}
+            end
+            local function clearable(e)
+              local t = e.type
+              return t == "tree" or t == "simple-entity" or t == "item-entity" or t == "resource" or t == "character"
+            end
             local function fits(ox, oy)
-              for _, s in pairs(L) do
-                local sp = spec(s, ox, oy)
-                if not S.can_place_entity(sp) then return false end
+              for _, s in pairs(B) do
+                if not S.can_place_entity(spec(s, ox, oy)) then
+                  local a = box(s, ox, oy)
+                  if S.count_tiles_filtered{{area = a, collision_mask = "water_tile"}} > 0 then return false end
+                  for _, e in pairs(S.find_entities_filtered{{area = a}}) do if not clearable(e) then return false end end
+                end
                 if s.on then
-                  local p = sp.position
+                  local p = spec(s, ox, oy).position
                   if S.count_entities_filtered{{name = s.on, area = {{{{p[1] - 1, p[2] - 1}}, {{p[1] + 1, p[2] + 1}}}}}} < 3 then return false end
                 end
+              end
+              if not ignore_reserved then
+                for _, s in pairs(L) do if reserved(box(s, ox, oy)) then return false end end
               end
               return true
             end
             local ox, oy
-            for r = {min_radius}, {radius} do
-              for dx = -r, r do for dy = -r, r do
-                if not ox and math.max(math.abs(dx), math.abs(dy)) == r and fits(cx + dx, cy + dy) then ox, oy = cx + dx, cy + dy end
-              end end
-              if ox then break end
+            local cands = helpers.json_to_table({_lua_str(candidates or [])})
+            if #cands > 0 then
+              for _, c in pairs(cands) do if fits(c[1], c[2]) then ox, oy = c[1], c[2] break end end
+            else
+              local cx, cy = math.floor({center[0]} / grid) * grid, math.floor({center[1]} / grid) * grid
+              for r = {min_radius}, {radius} do
+                for dx = -r, r do for dy = -r, r do
+                  if not ox and math.max(math.abs(dx), math.abs(dy)) == r and dx % grid == 0 and dy % grid == 0
+                     and fits(cx + dx, cy + dy) then ox, oy = cx + dx, cy + dy end
+                end end
+                if ox then break end
+              end
             end
             if not ox then out({{ok = false, reason = "no room nearby"}}) return end
-            local burners = 0
-            for _, s in pairs(L) do
-              local proto = prototypes.entity[s.name]
-              if proto.burner_prototype then burners = burners + 1 end
+            for _, s in pairs(B) do
+              for _, e in pairs(S.find_entities_filtered{{area = box(s, ox, oy)}}) do
+                if e.type == "character" then
+                  e.teleport(S.find_non_colliding_position("character", e.position, 20, 0.5) or e.position)
+                elseif e.type == "tree" or e.type == "simple-entity" then
+                  if not bot.mine_entity(e, true) then e.destroy() end
+                elseif e.type == "item-entity" then
+                  e.destroy()
+                end
+              end
             end
+            local burners = 0
+            for _, s in pairs(B) do if prototypes.entity[s.name].burner_prototype then burners = burners + 1 end end
             local coal_each = burners > 0 and math.min(5, math.floor(bot.get_item_count("coal") / burners)) or 0
-            for _, s in pairs(L) do
+            for _, s in pairs(B) do
               local sp = spec(s, ox, oy)
               sp.build_check_type = nil
               local e = S.create_entity(sp)
@@ -606,6 +572,21 @@ class Factorio:
               if s.recipe then e.set_recipe(s.recipe) end
               local fuel = e.get_fuel_inventory()
               if fuel and coal_each > 0 then fuel.insert{{name = "coal", count = coal_each}} bot.remove_item{{name = "coal", count = coal_each}} end
+            end
+            local site = {json.dumps(site) if site else 'nil'}
+            if site and #later > 0 then
+              local x0, y0, x1, y1 = math.huge, math.huge, -math.huge, -math.huge
+              for _, s in pairs(later) do
+                local a = box(s, ox, oy)
+                x0, y0, x1, y1 = math.min(x0, a[1][1]), math.min(y0, a[1][2]), math.max(x1, a[2][1]), math.max(y1, a[2][2])
+              end
+              table.insert(J.sites, {{kind = site, x = ox, y = oy, stage = stage, done = false, box = {{{{x0, y0}}, {{x1, y1}}}}}})
+            end
+            if site then
+              for _, s in pairs(J.sites) do if s.kind == site and s.x == ox and s.y == oy and #later == 0 then s.done = true end end
+            end
+            if {json.dumps(label)} ~= "" then
+              pcall(function() game.forces.player.add_chart_tag(S, {{position = {{ox, oy}}, text = {json.dumps("Jev: " + label)}}}) end)
             end
             out({{ok = true, x = ox, y = oy}})
         """)
@@ -639,6 +620,87 @@ class Factorio:
               placed = placed + 1
             end
             out({{ok = true, poles = placed}})
+        """)
+
+    def lay_belt(self, start: tuple[float, float], entry: dict, feeder: tuple[float, float] | None = None, label: str = "belt") -> dict:
+        """Belt from the `start` tile to the tile west of `entry`, ending pointed east into it.
+
+        `feeder`: also place a burner inserter there, picking up from the north and dropping onto the belt.
+        """
+        # ponytail: L-shaped routes only (two straight runs); swap for A* if patches are walled in by water or buildings.
+        fx, fy = feeder or (0, 0)
+        return self.lua(f"""
+            local sx, sy, tx, ty = {start[0]}, {start[1]}, {entry['x']} - 1, {entry['y']}
+            local feeder = {'true' if feeder else 'false'}
+            local function dir(dx, dy)
+              if dx > 0 then return "east" elseif dx < 0 then return "west" elseif dy > 0 then return "south" else return "north" end
+            end
+            local function route(horizontal_first)
+              local tiles, x, y = {{}}, sx, sy
+              local function run(axis, to)
+                while (axis == "x" and x ~= to) or (axis == "y" and y ~= to) do
+                  table.insert(tiles, {{x = x, y = y}})
+                  if axis == "x" then x = x + (to > x and 1 or -1) else y = y + (to > y and 1 or -1) end
+                end
+              end
+              if horizontal_first then run("x", tx) run("y", ty) else run("y", ty) run("x", tx) end
+              table.insert(tiles, {{x = tx, y = ty}})
+              for i = 1, #tiles - 1 do tiles[i].dir = dir(tiles[i + 1].x - tiles[i].x, tiles[i + 1].y - tiles[i].y) end
+              tiles[#tiles].dir = "east"
+              if #tiles > 1 and tiles[#tiles - 1].dir == "west" then return nil end
+              return tiles
+            end
+            local function free(x, y)
+              local tile = S.get_tile(x, y)
+              if not tile.valid or tile.collides_with("player") then return false end
+              if reserved({{{{x - 0.4, y - 0.4}}, {{x + 0.4, y + 0.4}}}}) then return false end
+              for _, e in pairs(S.find_entities_filtered{{area = {{{{x - 0.4, y - 0.4}}, {{x + 0.4, y + 0.4}}}}}}) do
+                if e.type ~= "tree" and e.type ~= "simple-entity" and e.type ~= "character" and e.type ~= "item-entity"
+                   and e.type ~= "resource" then return false end
+              end
+              return true
+            end
+            local tiles
+            for _, h in pairs({{true, false}}) do
+              local t = route(h)
+              if t and (not feeder or free({fx}, {fy})) then
+                local ok = true
+                for _, p in pairs(t) do if not free(p.x, p.y) then ok = false break end end
+                if ok then tiles = t break end
+              end
+            end
+            if not tiles then out({{ok = false, reason = "no straight route for a belt"}}) return end
+            if bot.get_item_count("transport-belt") < #tiles then out({{ok = false, reason = "missing transport-belt"}}) return end
+            if feeder and bot.get_item_count("burner-inserter") < 1 then out({{ok = false, reason = "missing burner-inserter"}}) return end
+            local function clear(x, y)
+              for _, e in pairs(S.find_entities_filtered{{area = {{{{x - 0.4, y - 0.4}}, {{x + 0.4, y + 0.4}}}}, type = {{"tree", "simple-entity", "item-entity"}}}}) do e.destroy() end
+            end
+            if feeder then
+              clear({fx}, {fy})
+              local ins = S.create_entity{{name = "burner-inserter", position = {{{fx}, {fy}}}, direction = defines.direction.north, force = "player"}}
+              bot.remove_item{{name = "burner-inserter", count = 1}}
+              track(ins)
+              J.roles[ins.unit_number] = "belt"
+              local fuel = math.min(2, bot.get_item_count("coal"))
+              if fuel > 0 then ins.get_fuel_inventory().insert{{name = "coal", count = fuel}} bot.remove_item{{name = "coal", count = fuel}} end
+            end
+            for _, p in pairs(tiles) do
+              clear(p.x, p.y)
+              local b = S.create_entity{{name = "transport-belt", position = {{p.x, p.y}}, direction = defines.direction[p.dir], force = "player"}}
+              track(b)
+              J.roles[b.unit_number] = "belt"
+            end
+            bot.remove_item{{name = "transport-belt", count = #tiles}}
+            pcall(function() game.forces.player.add_chart_tag(S, {{position = {{sx, sy}}, text = {json.dumps("Jev: " + label)}}}) end)
+            out({{ok = true, belts = #tiles}})
+        """)
+
+    def set_role(self, x: float, y: float, role: str):
+        """Re-tag the built entity at exactly (x, y)."""
+        self.lua(f"""
+            for _, e in pairs(J.built) do
+              if e.valid and e.position.x == {x} and e.position.y == {y} then J.roles[e.unit_number] = {json.dumps(role)} end
+            end
         """)
 
     def mark_power(self):
@@ -688,6 +750,10 @@ def show_thought(game: Factorio, step: int, thought, result: str | None = None):
           local f = screen.add{{type = "frame", name = "jev_brain", direction = "vertical", caption = "Jev's brain - step " .. d.step}}
           f.location = location or {{player.display_resolution.width - 460, 120}}
           f.style.width = 400
+          local cam = f.add{{type = "camera", position = bot.position, surface_index = S.index, zoom = 0.5}}
+          cam.entity = bot
+          cam.style.width = 376
+          cam.style.height = 220
           f.add{{type = "label", caption = "[font=default-bold]Doing:[/font] " .. d.choice}}
           f.add{{type = "label", caption = "[font=default-bold]Result:[/font] " .. d.result}}.style.single_line = false
           f.add{{type = "label", caption = "[font=default-bold]Bottleneck:[/font] " .. d.bottleneck}}
